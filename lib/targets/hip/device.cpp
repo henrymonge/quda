@@ -166,6 +166,8 @@ namespace quda
       return true;
     }
 
+
+#if 0 //old code for shared mem
 #if 0
     size_t max_default_shared_memory() { return deviceProp.sharedMemPerBlock-1; } 
 
@@ -179,6 +181,27 @@ namespace quda
     size_t max_default_shared_memory() { return 32000; }
 
     size_t max_dynamic_shared_memory() { return 32000; }
+#endif
+
+#else
+    // QUDA_HIP_MAX_SHARED_BYTES=<n> caps it at run time, e.g. 32000 to get the old behaviour.
+    size_t max_dynamic_shared_memory()
+    {
+      static size_t max_shared_bytes = 0;
+      if (!max_shared_bytes) {
+        int dev_max = 0;
+        CHECK_HIP_ERROR(hipDeviceGetAttribute(&dev_max, hipDeviceAttributeMaxSharedMemoryPerBlock, comm_gpuid()));
+        max_shared_bytes = dev_max - 1;
+        if (const char *env = getenv("QUDA_HIP_MAX_SHARED_BYTES")) {
+          max_shared_bytes = std::min(max_shared_bytes, static_cast<size_t>(std::stoul(env)));
+          logQuda(QUDA_SUMMARIZE, "HIP shared memory limit capped at %lu bytes by QUDA_HIP_MAX_SHARED_BYTES\n", max_shared_bytes);
+        }
+      }
+      return max_shared_bytes;
+    }
+
+    size_t max_default_shared_memory() { return max_dynamic_shared_memory(); }
+
 #endif
 
     unsigned int max_threads_per_block() { return deviceProp.maxThreadsPerBlock; }

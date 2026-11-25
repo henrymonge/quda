@@ -24,17 +24,62 @@ namespace quda {
     const int *fine_to_coarse;
     const int *coarse_to_fine;
     const int parity;
+    const RestrictRowGeometry row_geo; // geometry for the row-mapped kernel (RestrictorRow)
+
+    // kernel choice is tuned through aux.y: 1 = RestrictorRow with aux.z row slices per block,
+    // anything else = Restrictor with swizzle factor aux.x (also matches older tunecache entries)
+    static bool useRowKernel(const TuneParam &param) { return param.aux.y == 1; }
 
     bool tuneSharedBytes() const { return false; }
     bool tuneAuxDim() const { return true; }
     unsigned int minThreads() const { return in.Volume(); } // fine parity is the block y dimension
+
+    // RestrictorRow keeps one partial sum per thread in shared memory; Restrictor needs none
+    unsigned int sharedBytesPerBlock(const TuneParam &param) const
+    {
+      using vector = typename RestrictorParams<Arg<false>>::vector;
+      return useRowKernel(param) ? param.block.x * param.block.y * param.block.z * sizeof(vector) : 0;
+    }
+
+    void setRowLaunch(TuneParam &param) const
+    {
+      param.block.x = row_geo.xcb * param.aux.z;
+      param.grid.x = row_geo.lines;
+      setSharedBytes(param);
+    }
+
+    void setAggregateLaunch(TuneParam &param) const
+    {
+      param.block.x = blockMapper();
+      param.grid.x = out.Volume();
+      param.shared_bytes = 0;
+    }
+
+    bool rowLaunchValid(const TuneParam &param) const
+    {
+      return row_geo.ok && param.aux.z <= row_geo.rows
+        && param.block.x * param.block.y * param.block.z <= device::max_threads_per_block()
+        && param.shared_bytes <= maxSharedBytesPerBlock();
+    }
+
+    template <bool from_non_rel> void launchArg(const TuneParam &tp, const qudaStream_t &stream)
+    {
+      Arg<from_non_rel> arg(out, in, v, fine_to_coarse, coarse_to_fine, parity);
+      if (useRowKernel(tp)) {
+        arg.swizzle_factor = 1; // the row-mapped kernel does not swizzle its blocks
+        launch<RestrictorRow, Aggregates>(tp, stream, arg);
+      } else {
+        arg.swizzle_factor = tp.aux.x;
+        launch<Restrictor, Aggregates>(tp, stream, arg);
+      }
+    }
 
   public:
     RestrictLaunch(cvector_ref<ColorSpinorField> &out, cvector_ref<const ColorSpinorField> &in, const ColorSpinorField &v,
                    const int *fine_to_coarse, const int *coarse_to_fine, int parity) :
       TunableBlock2D(in[0], false, out.size() * (coarseColor / coarse_colors_per_thread<fineColor, coarseColor>()), max_z_block()),
       out(out), in(in), v(v), fine_to_coarse(fine_to_coarse), coarse_to_fine(coarse_to_fine),
-      parity(parity)
+      parity(parity), row_geo(restrictRowGeometry(out[0], in[0]))
     {
       strcat(vol, ",");
       strcat(vol, out.VolString().c_str());
@@ -42,6 +87,7 @@ namespace quda {
       strcat(aux, out.AuxString().c_str());
       setRHSstring(aux, in.size());
       if (in[0].GammaBasis() == QUDA_UKQCD_GAMMA_BASIS) strcat(aux, ",from_non_rel");
+      if (row_geo.ok) strcat(aux, ",row_kernel"); // new tunecache entry, so the row kernel gets tried
 
       apply(device::get_default_stream());
     }
@@ -52,33 +98,50 @@ namespace quda {
       if (checkNative(out[0], in[0], v)) {
         if constexpr (fineSpin == 4) {
           if (in[0].GammaBasis() == QUDA_UKQCD_GAMMA_BASIS) {
-            Arg<true> arg(out, in, v, fine_to_coarse, coarse_to_fine, parity);
-            arg.swizzle_factor = tp.aux.x;
-            launch<Restrictor, Aggregates>(tp, stream, arg);
+            launchArg<true>(tp, stream);
           } else {
-            Arg<false> arg(out, in, v, fine_to_coarse, coarse_to_fine, parity);
-            arg.swizzle_factor = tp.aux.x;
-            launch<Restrictor, Aggregates>(tp, stream, arg);
+            launchArg<false>(tp, stream);
           }
         } else {
-          Arg<false> arg(out, in, v, fine_to_coarse, coarse_to_fine, parity);
-          arg.swizzle_factor = tp.aux.x;
-          launch<Restrictor, Aggregates>(tp, stream, arg);
+          launchArg<false>(tp, stream);
         }
       }
     }
 
     bool advanceAux(TuneParam &param) const
     {
-      if (Arg<false>::swizzle && in.size() < 8) {
-        if (param.aux.x < 2 * (int)device::processor_count()) {
-          param.aux.x++;
-          return true;
-        } else {
+      if (!useRowKernel(param)) {
+        // Restrictor: tune the CTA swizzle factor
+        if (Arg<false>::swizzle && in.size() < 8) {
+          if (param.aux.x < 2 * (int)device::processor_count()) {
+            param.aux.x++;
+            return true;
+          }
           param.aux.x = 1;
-          return false;
         }
+        // then try RestrictorRow, starting with one row slice per block
+        TuneParam next = param;
+        next.aux.y = 1;
+        next.aux.z = 1;
+        setRowLaunch(next);
+        if (rowLaunchValid(next)) {
+          param = next;
+          return true;
+        }
+        return false;
       } else {
+        // RestrictorRow: double the number of row slices per block
+        TuneParam next = param;
+        next.aux.z *= 2;
+        setRowLaunch(next);
+        if (rowLaunchValid(next)) {
+          param = next;
+          return true;
+        }
+        // done: back to Restrictor
+        param.aux.y = 0;
+        param.aux.z = 1;
+        setAggregateLaunch(param);
         return false;
       }
     }
@@ -105,6 +168,8 @@ namespace quda {
       param.grid.x = out.Volume();
       param.shared_bytes = 0;
       param.aux.x = 2; // swizzle factor
+      param.aux.y = 0; // start with Restrictor
+      param.aux.z = 1; // row slices per block (RestrictorRow only)
     }
 
     void defaultTuneParam(TuneParam &param) const
@@ -114,6 +179,8 @@ namespace quda {
       param.grid.x = out.Volume();
       param.shared_bytes = 0;
       param.aux.x = 2; // swizzle factor
+      param.aux.y = 0; // Restrictor
+      param.aux.z = 1;
     }
 
     long long flops() const

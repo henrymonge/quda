@@ -4,6 +4,7 @@
 #include <fast_intdiv.h>
 #include <array.h>
 #include <block_reduction_kernel.h>
+#include <shared_memory_cache_helper.h>
 
 namespace quda {
 
@@ -17,6 +18,62 @@ namespace quda {
   }
 
   constexpr int max_z_block() { return 12; }
+
+  /**
+     Geometry used by the row-mapped restrictor (RestrictorRow): the
+     fine and coarse local extents, the aggregate size and the derived
+     row and line counts.  ok is false when the row-mapped kernel
+     cannot be used for this pair of fields.
+  */
+  struct RestrictRowGeometry {
+    bool ok = false;
+    int xcb = 0;                   // fine checkerboard sites per x-row (fine X / 2)
+    int g = 0;                     // checkerboard sites per aggregate per x-row (aggregate X / 2)
+    int x1 = 0, x2 = 0;            // fine Y and Z extents
+    int xc0 = 0, xc1 = 0, xc2 = 0; // coarse X, Y and Z extents
+    int bs1 = 0, bs2 = 0, bs3 = 0; // aggregate Y, Z and T extents
+    int rows = 0;                  // x-rows per aggregate (bs1 * bs2 * bs3)
+    int lines = 0;                 // lines of aggregates along x (coarse Y * Z * T)
+  };
+
+  /**
+     @brief Compute the RestrictRowGeometry for restricting in to out.
+     The row-mapped kernel requires a single-parity 4-d fine field, a
+     full (both parity) coarse field, and an even aggregate extent in
+     x, so that each aggregate owns a whole number of checkerboard
+     sites in every x-row.
+  */
+  inline RestrictRowGeometry restrictRowGeometry(const ColorSpinorField &out, const ColorSpinorField &in)
+  {
+    RestrictRowGeometry geo;
+    if (in.Ndim() != 4 || out.Ndim() != 4 || in.SiteSubset() != QUDA_PARITY_SITE_SUBSET
+        || out.SiteSubset() != QUDA_FULL_SITE_SUBSET)
+      return geo;
+
+    int xf[4], xc[4], bs[4];
+    for (int d = 0; d < 4; d++) {
+      xf[d] = in.X()[d] * (d == 0 ? 2 : 1); // a single-parity field stores X / 2
+      xc[d] = out.X()[d];
+      if (xc[d] <= 0 || xf[d] % xc[d] != 0) return geo;
+      bs[d] = xf[d] / xc[d];
+    }
+    if (bs[0] % 2 != 0) return geo;
+
+    geo.xcb = xf[0] / 2;
+    geo.g = bs[0] / 2;
+    geo.x1 = xf[1];
+    geo.x2 = xf[2];
+    geo.xc0 = xc[0];
+    geo.xc1 = xc[1];
+    geo.xc2 = xc[2];
+    geo.bs1 = bs[1];
+    geo.bs2 = bs[2];
+    geo.bs3 = bs[3];
+    geo.rows = bs[1] * bs[2] * bs[3];
+    geo.lines = xc[1] * xc[2] * xc[3];
+    geo.ok = true;
+    return geo;
+  }
 
   /** 
       Kernel argument struct
@@ -52,6 +109,11 @@ namespace quda {
     static constexpr bool swizzle = true;
     int_fastdiv swizzle_factor; // for transposing blockIdx.x mapping to coarse grid coordinate
 
+    // geometry for the row-mapped kernel (RestrictorRow), unused by Restrictor
+    int row_xcb = 0, row_g = 0, row_x1 = 0, row_x2 = 0;
+    int row_xc0 = 0, row_xc1 = 0, row_xc2 = 0;
+    int row_bs1 = 0, row_bs2 = 0, row_bs3 = 0, row_rows = 0;
+
     // when setting n_vector_z we can only use the compile-time part so can't include n_src in this min (not really an issue)
     static constexpr int n_vector_z = std::min(coarseColor/coarse_colors_per_thread<fineColor, coarseColor>(), max_z_block());
     static_assert(n_vector_z > 0, "n_vector_z cannot be less than 1");
@@ -81,6 +143,19 @@ namespace quda {
         this->out[i] = out[i];
         this->in[i] = in[i];
       }
+
+      auto geo = restrictRowGeometry(out[0], in[0]);
+      row_xcb = geo.xcb;
+      row_g = geo.g;
+      row_x1 = geo.x1;
+      row_x2 = geo.x2;
+      row_xc0 = geo.xc0;
+      row_xc1 = geo.xc1;
+      row_xc2 = geo.xc2;
+      row_bs1 = geo.bs1;
+      row_bs2 = geo.bs2;
+      row_bs3 = geo.bs3;
+      row_rows = geo.rows;
     }
   };
 
@@ -199,6 +274,107 @@ namespace quda {
               arg.out[src_idx](parity_coarse, x_coarse_cb, s, v)
                 = reduced[s * coarse_color_per_thread + coarse_color_local];
             }
+          }
+        }
+      }
+    }
+  };
+
+  /**
+     Row-mapped restrictor.  Each thread block handles one line of
+     aggregates along x (fixed coarse y, z, t).  Consecutive threads
+     take consecutive fine checkerboard sites along an x-row, so the
+     loads of the fine spinor and of V are contiguous, unlike
+     Restrictor where the threads of a block gather the scattered
+     sites of a single aggregate.  The block has block_dim.x / xcb row
+     slices; each thread accumulates the aggregate its x position
+     belongs to over the aggregate rows of its slice, and the partial
+     sums are combined through shared memory.  Requires
+     RestrictRowGeometry::ok.
+  */
+  template <typename Arg> struct RestrictorRow : KernelOps<SharedMemoryCache<typename RestrictorParams<Arg>::vector>> {
+    static constexpr int coarse_color_per_thread = RestrictorParams<Arg>::coarse_color_per_thread;
+    using vector = typename RestrictorParams<Arg>::vector;
+    using Cache = SharedMemoryCache<vector>;
+    const Arg &arg;
+    using typename KernelOps<Cache>::KernelOpsT;
+    template <typename... Ops>
+    constexpr RestrictorRow(const Arg &arg, const Ops &...ops) : KernelOpsT(ops...), arg(arg) { }
+    static constexpr const char *filename() { return KERNEL_FILE; }
+
+    __device__ __host__ inline void operator()(dim3 block, dim3 thread)
+    {
+      const int src_coarse_color_thread = block.z * arg.block_dim.z + thread.z;
+      const int src_idx = src_coarse_color_thread % arg.n_src;
+      const int coarse_color_thread = src_coarse_color_thread / arg.n_src;
+      const int coarse_color_block = coarse_color_thread * coarse_color_per_thread;
+      const int parity = arg.parity;
+
+      // line of aggregates handled by this block
+      const int line = block.x;
+      const int yc = line % arg.row_xc1;
+      const int zc = (line / arg.row_xc1) % arg.row_xc2;
+      const int tc = line / (arg.row_xc1 * arg.row_xc2);
+
+      const int lane = thread.x % arg.row_xcb;           // checkerboard x position in the row
+      const int slice = thread.x / arg.row_xcb;          // which subset of the aggregate rows
+      const int n_slice = arg.block_dim.x / arg.row_xcb; // number of row slices in the block
+
+      vector partial{0};
+      for (int k = slice; k < arg.row_rows; k += n_slice) {
+        const int y = yc * arg.row_bs1 + k % arg.row_bs1;
+        const int z = zc * arg.row_bs2 + (k / arg.row_bs1) % arg.row_bs2;
+        const int t = tc * arg.row_bs3 + k / (arg.row_bs1 * arg.row_bs2);
+        const int x_fine_cb = ((t * arg.row_x2 + z) * arg.row_x1 + y) * arg.row_xcb + lane;
+
+        array<complex<typename Arg::real>, Arg::fineSpin * coarse_color_per_thread> tmp{0};
+
+        rotateCoarseColor(tmp, arg, src_idx, parity, x_fine_cb, coarse_color_block);
+
+        // perform any local spin coarsening
+#pragma unroll
+        for (int s = 0; s < Arg::fineSpin; s++) {
+#pragma unroll
+          for (int v = 0; v < coarse_color_per_thread; v++) {
+            if (arg.spin_map(s, parity) == 0) {
+              partial[0 * coarse_color_per_thread + v] += tmp[s * coarse_color_per_thread + v];
+            } else {
+              partial[1 * coarse_color_per_thread + v] += tmp[s * coarse_color_per_thread + v];
+            }
+          }
+        }
+      }
+
+      Cache cache {*this};
+      cache.save(partial);
+      cache.sync();
+
+      // one thread per aggregate of the line sums its g lanes over all row slices
+      if (static_cast<int>(thread.x) < arg.row_xc0) {
+        const int a = thread.x;
+        vector sum{0};
+        for (int s = 0; s < n_slice; s++) {
+          for (int j = 0; j < arg.row_g; j++) {
+            const vector p = cache.load_x(s * arg.row_xcb + a * arg.row_g + j);
+#pragma unroll
+            for (int i = 0; i < Arg::coarseSpin * coarse_color_per_thread; i++) sum[i] += p[i];
+          }
+        }
+
+        // coarse site of aggregate a, from the first fine site of its first row
+        const int x_fine_cb0
+          = (((tc * arg.row_bs3) * arg.row_x2 + zc * arg.row_bs2) * arg.row_x1 + yc * arg.row_bs1) * arg.row_xcb
+          + a * arg.row_g;
+        const int x_coarse = arg.fine_to_coarse[parity * arg.in[src_idx].VolumeCB() + x_fine_cb0];
+        const int parity_coarse = x_coarse >= arg.out[src_idx].VolumeCB() ? 1 : 0;
+        const int x_coarse_cb = x_coarse - parity_coarse * arg.out[src_idx].VolumeCB();
+
+#pragma unroll
+        for (int s = 0; s < Arg::coarseSpin; s++) {
+#pragma unroll
+          for (int coarse_color_local = 0; coarse_color_local < coarse_color_per_thread; coarse_color_local++) {
+            int v = coarse_color_thread * coarse_color_per_thread + coarse_color_local;
+            arg.out[src_idx](parity_coarse, x_coarse_cb, s, v) = sum[s * coarse_color_per_thread + coarse_color_local];
           }
         }
       }
